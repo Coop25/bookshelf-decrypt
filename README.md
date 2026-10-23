@@ -1,4 +1,4 @@
-# audible-to-mp3
+# bookshelf-decrypt
 
 Personal-use tool for downloading audiobooks you've bought on Audible and
 converting them from AAX/AAXC to plain MP3, without going through a
@@ -168,7 +168,7 @@ information from argparse directly.
 ## File layout
 
 ```
-audible-to-mp3/
+bookshelf-decrypt/
 ├── audible_mp3.py        # the whole tool — a single-file CLI
 ├── requirements.txt       # audible-cli, tqdm
 ├── Dockerfile             # python + ffmpeg + audible-cli, baked in
