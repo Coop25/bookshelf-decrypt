@@ -1,0 +1,9 @@
+services:
+  audible-mp3:
+    build: .
+    volumes:
+      - ./downloads:/app/downloads
+      - ./mp3:/app/mp3
+      - ./audible_config:/root/.audible
+    stdin_open: true
+    tty: true

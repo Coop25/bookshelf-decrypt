@@ -1,0 +1,31 @@
+# --- This project's working directories ---
+downloads/
+mp3/
+audible_config/
+.activation_bytes
+
+# --- Safety net: never let book/audio files slip in from elsewhere ---
+# (in case someone points --output-dir, moves files around, etc.)
+*.aax
+*.aaxc
+*.aa
+*.m4a
+*.m4b
+*.mp3
+*.flac
+*.ogg
+*.wav
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
