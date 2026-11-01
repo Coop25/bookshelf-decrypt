@@ -30,22 +30,6 @@ def run(cmd, **kwargs):
     subprocess.run(cmd, check=True, **kwargs)
 
 
-def audible_cmd(*args):
-    # --password is a global option on the `audible` group, so it has to
-    # come before the subcommand. Reading it from an env var lets every
-    # audible-cli call here go non-interactive if the auth file is
-    # password-protected - without it, a protected auth file prompts on
-    # stdin every time, and if more than one `audible` process is ever
-    # running at once, their prompts race on the same stdin and none of
-    # them can be answered correctly.
-    cmd = ["audible"]
-    password = os.environ.get("AUDIBLE_PASSWORD")
-    if password:
-        cmd += ["--password", password]
-    cmd += list(args)
-    return cmd
-
-
 def cmd_login(_args):
     # Interactive OAuth flow: opens a URL you visit in a browser, then you
     # paste back the redirect URL it lands on. One-time per account.
@@ -107,7 +91,7 @@ def _verify_logged_out():
     # needs valid credentials, instead of just trusting the file deletions.
     try:
         result = subprocess.run(
-            audible_cmd("library", "list"), capture_output=True, text=True, timeout=30
+            ["audible", "library", "list"], capture_output=True, text=True, timeout=30
         )
     except (OSError, subprocess.TimeoutExpired):
         return
@@ -124,7 +108,7 @@ def get_activation_bytes(force=False):
     if not force and ACTIVATION_BYTES_CACHE.exists():
         return ACTIVATION_BYTES_CACHE.read_text().strip()
     result = subprocess.run(
-        audible_cmd("activation-bytes"), check=True, capture_output=True, text=True
+        ["audible", "activation-bytes"], check=True, capture_output=True, text=True
     )
     bytes_value = result.stdout.strip().splitlines()[-1].strip()
     ACTIVATION_BYTES_CACHE.write_text(bytes_value)
@@ -142,7 +126,7 @@ def _fetch_library():
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_file = Path(tmp_dir) / "library.json"
         subprocess.run(
-            audible_cmd("library", "export", "-f", "json", "-o", str(tmp_file)),
+            ["audible", "library", "export", "-f", "json", "-o", str(tmp_file)],
             check=True,
         )
         return json.loads(tmp_file.read_text())
@@ -165,7 +149,7 @@ def _asins_starting_with(letter):
 
 def cmd_download(args):
     DOWNLOAD_DIR.mkdir(exist_ok=True)
-    cmd = audible_cmd("download", "--output-dir", str(DOWNLOAD_DIR), "--aax")
+    cmd = ["audible", "download", "--output-dir", str(DOWNLOAD_DIR), "--aax"]
     if args.starts_with:
         matches = _asins_starting_with(args.starts_with)
         if not matches:
@@ -272,7 +256,8 @@ def cmd_batch(args):
     # did) paid that cost once per *book* instead of once per *run* -
     # which is what made --jobs look broken/serial. --jobs here is
     # audible-cli's own internal concurrency within this one process.
-    dl_cmd = audible_cmd(
+    dl_cmd = [
+        "audible",
         "download",
         "--output-dir",
         str(DOWNLOAD_DIR),
@@ -282,7 +267,7 @@ def cmd_batch(args):
         "--jobs",
         str(args.jobs),
         "--ignore-errors",
-    )
+    ]
     for asin in remaining:
         dl_cmd += ["--asin", asin]
     print("$", " ".join(dl_cmd))

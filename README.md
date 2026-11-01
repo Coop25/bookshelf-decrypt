@@ -340,15 +340,12 @@ nothing to remove instead of pretending it did something.
 - **Stuck repeating `Please enter the auth-file password` / `Auth file is
   encrypted but no/wrong password is provided`, especially with `batch`.**
   Your `audible-cli` auth file is password-protected (you set a password
-  during `login`/`quickstart`). Either type that password at the prompt —
-  it should only ask once per run — or set it as an environment variable
-  so nothing ever prompts: `AUDIBLE_PASSWORD=yourpassword docker compose
-  run --rm -e AUDIBLE_PASSWORD audible-mp3 batch …` (or just `export
-  AUDIBLE_PASSWORD=yourpassword` first, for local Python). If you saw this
-  loop endlessly and never accept the password no matter what you typed,
-  that was a bug in an earlier version of `batch` that ran many `audible`
-  processes at once, all fighting over the same terminal input — update
-  to the latest version, which runs one process for the whole run.
+  during `login`/`quickstart`) — type that password at the prompt; it
+  should only ask once per run. If you saw this loop endlessly and never
+  accept the password no matter what you typed, that was a bug in an
+  earlier version of `batch` that ran many `audible` processes at once,
+  all fighting over the same terminal input — update to the latest
+  version, which runs one process for the whole run.
 - **Windows: `python` isn't recognized.** Use the Docker setup, or install
   Python from [python.org](https://www.python.org/) and make sure "Add
   python.exe to PATH" was checked during install.
