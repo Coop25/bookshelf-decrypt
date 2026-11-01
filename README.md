@@ -189,16 +189,22 @@ Pick per-command, e.g. `python audible_mp3.py batch --format m4b`.
 for a big library the `.aax` files for the *whole* batch have to fit on
 disk at once — not realistic for, say, 840 books on a laptop drive.
 
-`batch` instead keeps at most `--jobs` downloads in flight at once, and as
-soon as any *one* of them finishes, converts that book and deletes its
-`.aax` immediately — it never waits for the others still downloading
-before converting a book that's already done. Progress is tracked in
-`downloads/.sync_progress.json`, so if it's interrupted (Ctrl-C, a reboot,
-running out of space anyway) you can just re-run the exact same command and
-it skips everything already converted and picks up where it stopped —
-no need to track which books are done yourself. A title whose download
-fails is skipped (logged at the end) and simply retried on the next run,
-instead of aborting the whole thing.
+`batch` instead runs one `audible download` process for everything
+pending (`--jobs` controls audible-cli's own internal download
+concurrency within that process) and polls for finished files, converting
+and deleting each book's `.aax` the moment it lands — it never waits for
+the others still downloading before converting a book that's already
+done. It's deliberately *one* process rather than one per book: audible-cli
+re-syncs your whole library on every invocation it runs, so spawning a
+separate process per title would pay that cost 840 times over instead of
+once, which in practice looks like downloads stalling or `--jobs` doing
+nothing. Progress is tracked in `downloads/.sync_progress.json`, so if
+it's interrupted (Ctrl-C, a reboot, running out of space anyway) you can
+just re-run the exact same command and it skips everything already
+converted and picks up where it stopped — no need to track which books
+are done yourself. A title whose download fails is skipped (logged at the
+end) and simply retried on the next run, instead of aborting the whole
+thing.
 
 ```bash
 # 3 downloads in flight at once, refusing to start a new one once
@@ -217,9 +223,10 @@ plus its converted `.mp3` run to ~1 GB combined, `--jobs 3` needs roughly
 3 GB free at any one time, regardless of how many hundreds of books are
 left overall (an in-progress download disappears the moment it finishes
 and gets converted — it doesn't pile up). `--min-free-gb` is a safety
-margin on top of that — it stops *new* downloads from starting (letting
-whatever's already in flight finish normally) rather than failing
-partway through one.
+margin on top of that — it stops the whole download process once free
+space drops too low, rather than letting it run until something actually
+fails. Anything already converted at that point stays done; whatever
+was still downloading just gets retried on the next run.
 
 **How "already done" is tracked.** Each title counts as done only once
 it's been fully *converted* — a book that only got partway through
@@ -257,7 +264,7 @@ container runs just like the downloaded files do).
 | `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--starts-with LETTER` — only titles starting with this letter (leading "a"/"an"/"the" is ignored, e.g. *The Hobbit* counts as "H"); `--jobs N` — simultaneous downloads (default `3`); `--strict` — abort on the first title that fails instead of the default of skipping it and continuing. |
 | `convert` | Converts every `.aax`/`.aaxc` file in `./downloads` to MP3 (or M4B) in `./mp3`, with a progress bar per file. | `--format {mp3,m4b}` — see [Output format: MP3 vs M4B](#output-format-mp3-vs-m4b) (default `mp3`); `--force` — re-convert even if an output file with that name already exists (default: skip). |
 | `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--starts-with`, `--jobs`, `--strict`, `--format`, `--force`). |
-| `batch` | Keeps up to `--jobs` downloads in flight, converting (and deleting the `.aax` of) each one the instant its own download finishes rather than waiting on the others, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off; a failed title is logged and retried next run instead of aborting everything. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--jobs N` — downloads in flight at once (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop starting new downloads if free space drops below this (default `2.0`, `0` disables). |
+| `batch` | Keeps up to `--jobs` downloads in flight, converting (and deleting the `.aax` of) each one the instant its own download finishes rather than waiting on the others, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off; a failed title is logged and retried next run instead of aborting everything. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--jobs N` — downloads in flight at once (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop the download process if free space drops below this (default `2.0`, `0` disables). |
 
 Run `python audible_mp3.py <command> --help` (or
 `docker compose run --rm audible-mp3 <command> --help`) for the same
@@ -330,6 +337,18 @@ nothing to remove instead of pretending it did something.
   for that file.
 - **Activation bytes seem stale / decryption fails after re-registering a
   device.** Run `python audible_mp3.py activation-bytes --refresh`.
+- **Stuck repeating `Please enter the auth-file password` / `Auth file is
+  encrypted but no/wrong password is provided`, especially with `batch`.**
+  Your `audible-cli` auth file is password-protected (you set a password
+  during `login`/`quickstart`). Either type that password at the prompt —
+  it should only ask once per run — or set it as an environment variable
+  so nothing ever prompts: `AUDIBLE_PASSWORD=yourpassword docker compose
+  run --rm -e AUDIBLE_PASSWORD audible-mp3 batch …` (or just `export
+  AUDIBLE_PASSWORD=yourpassword` first, for local Python). If you saw this
+  loop endlessly and never accept the password no matter what you typed,
+  that was a bug in an earlier version of `batch` that ran many `audible`
+  processes at once, all fighting over the same terminal input — update
+  to the latest version, which runs one process for the whole run.
 - **Windows: `python` isn't recognized.** Use the Docker setup, or install
   Python from [python.org](https://www.python.org/) and make sure "Add
   python.exe to PATH" was checked during install.

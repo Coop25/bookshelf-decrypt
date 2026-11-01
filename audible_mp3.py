@@ -7,7 +7,6 @@ around audible-cli (for auth/download) and ffmpeg (for decrypt+transcode).
 """
 
 import argparse
-import concurrent.futures
 import json
 import os
 import re
@@ -15,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from tqdm import tqdm
@@ -28,6 +28,22 @@ ACTIVATION_BYTES_CACHE = ROOT / ".activation_bytes"
 def run(cmd, **kwargs):
     print("$", " ".join(cmd))
     subprocess.run(cmd, check=True, **kwargs)
+
+
+def audible_cmd(*args):
+    # --password is a global option on the `audible` group, so it has to
+    # come before the subcommand. Reading it from an env var lets every
+    # audible-cli call here go non-interactive if the auth file is
+    # password-protected - without it, a protected auth file prompts on
+    # stdin every time, and if more than one `audible` process is ever
+    # running at once, their prompts race on the same stdin and none of
+    # them can be answered correctly.
+    cmd = ["audible"]
+    password = os.environ.get("AUDIBLE_PASSWORD")
+    if password:
+        cmd += ["--password", password]
+    cmd += list(args)
+    return cmd
 
 
 def cmd_login(_args):
@@ -91,7 +107,7 @@ def _verify_logged_out():
     # needs valid credentials, instead of just trusting the file deletions.
     try:
         result = subprocess.run(
-            ["audible", "library", "list"], capture_output=True, text=True, timeout=30
+            audible_cmd("library", "list"), capture_output=True, text=True, timeout=30
         )
     except (OSError, subprocess.TimeoutExpired):
         return
@@ -108,7 +124,7 @@ def get_activation_bytes(force=False):
     if not force and ACTIVATION_BYTES_CACHE.exists():
         return ACTIVATION_BYTES_CACHE.read_text().strip()
     result = subprocess.run(
-        ["audible", "activation-bytes"], check=True, capture_output=True, text=True
+        audible_cmd("activation-bytes"), check=True, capture_output=True, text=True
     )
     bytes_value = result.stdout.strip().splitlines()[-1].strip()
     ACTIVATION_BYTES_CACHE.write_text(bytes_value)
@@ -126,7 +142,7 @@ def _fetch_library():
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_file = Path(tmp_dir) / "library.json"
         subprocess.run(
-            ["audible", "library", "export", "-f", "json", "-o", str(tmp_file)],
+            audible_cmd("library", "export", "-f", "json", "-o", str(tmp_file)),
             check=True,
         )
         return json.loads(tmp_file.read_text())
@@ -149,7 +165,7 @@ def _asins_starting_with(letter):
 
 def cmd_download(args):
     DOWNLOAD_DIR.mkdir(exist_ok=True)
-    cmd = ["audible", "download", "--output-dir", str(DOWNLOAD_DIR), "--aax"]
+    cmd = audible_cmd("download", "--output-dir", str(DOWNLOAD_DIR), "--aax")
     if args.starts_with:
         matches = _asins_starting_with(args.starts_with)
         if not matches:
@@ -213,21 +229,14 @@ def _cleanup_stale_tmp_artifacts():
             stale.unlink(missing_ok=True)
 
 
-def _download_single(asin):
-    cmd = [
-        "audible",
-        "download",
-        "--output-dir",
-        str(DOWNLOAD_DIR),
-        "--aax",
-        "--filename-mode",
-        "asin_ascii",
-        "--asin",
-        asin,
-    ]
-    print("$", " ".join(cmd))
-    result = subprocess.run(cmd)
-    return result.returncode == 0
+POLL_INTERVAL = 1.5
+
+
+def _find_downloaded(asin):
+    matches = sorted(DOWNLOAD_DIR.glob(f"{asin}_*.aax")) + sorted(
+        DOWNLOAD_DIR.glob(f"{asin}_*.aaxc")
+    )
+    return matches[0] if matches else None
 
 
 def cmd_batch(args):
@@ -254,76 +263,92 @@ def cmd_batch(args):
         f"(resuming; {len(done)} already done)."
     )
 
+    by_asin = {item["asin"]: item for item in pending}
+    remaining = set(by_asin)
+
+    # One audible-cli process for everything pending: audible-cli re-syncs
+    # your whole library on every invocation regardless of --asin, so
+    # spawning a separate process per title (as an earlier version of this
+    # did) paid that cost once per *book* instead of once per *run* -
+    # which is what made --jobs look broken/serial. --jobs here is
+    # audible-cli's own internal concurrency within this one process.
+    dl_cmd = audible_cmd(
+        "download",
+        "--output-dir",
+        str(DOWNLOAD_DIR),
+        "--aax",
+        "--filename-mode",
+        "asin_ascii",
+        "--jobs",
+        str(args.jobs),
+        "--ignore-errors",
+    )
+    for asin in remaining:
+        dl_cmd += ["--asin", asin]
+    print("$", " ".join(dl_cmd))
+    proc = subprocess.Popen(dl_cmd)
+
     failed = []
     stopped_early = False
-    next_index = 0
-    max_workers = max(1, args.jobs)
 
-    def start_next(executor, in_flight):
-        nonlocal next_index, stopped_early
-        if stopped_early or next_index >= len(pending):
-            return
-        if args.min_free_gb:
-            free = _free_gb(DOWNLOAD_DIR)
-            if free < args.min_free_gb:
-                print(
-                    f"\nOnly {free:.1f} GB free, below --min-free-gb {args.min_free_gb}. "
-                    "Not starting any new downloads. Letting in-flight ones finish, "
-                    "then stop. Free up space and re-run this exact command to "
-                    "continue."
-                )
-                stopped_early = True
-                return
-        item = pending[next_index]
-        next_index += 1
-        future = executor.submit(_download_single, item["asin"])
-        in_flight[future] = item
+    def convert_ready(asin):
+        src = _find_downloaded(asin)
+        if src is None:
+            return False
+        item = by_asin[asin]
+        title_stem = _strip_asin_prefix(src.stem, asin)
+        dest = MP3_DIR / (title_stem + "." + args.format)
+        if dest.exists():
+            # Two different books slugified down to the same name (rare,
+            # but possible with near-duplicate titles) - disambiguate
+            # instead of one overwriting the other.
+            dest = MP3_DIR / f"{title_stem} ({asin}).{args.format}"
+        progress = f"[{len(done) + 1}/{total}]"
+        print(f"{progress} converting: {src.name}")
+        convert_one(src, dest, activation_bytes, fmt=args.format)
+        if not args.keep_source:
+            src.unlink(missing_ok=True)
+        done.add(asin)
+        remaining.discard(asin)
+        _save_progress(done)
+        return True
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        in_flight = {}
-        for _ in range(max_workers):
-            start_next(executor, in_flight)
+    try:
+        while remaining:
+            for asin in list(remaining):
+                convert_ready(asin)
 
-        while in_flight:
-            finished, _ = concurrent.futures.wait(
-                in_flight, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for future in finished:
-                item = in_flight.pop(future)
-                asin = item["asin"]
-                title = item.get("title", asin)
-                progress = f"[{len(done) + len(failed) + 1}/{total}]"
+            if not remaining:
+                break
 
-                if not future.result():
-                    print(f"{progress} ! {title} ({asin}): download failed, will retry later")
-                    failed.append(item)
-                    start_next(executor, in_flight)
-                    continue
+            if proc.poll() is not None:
+                # One more sweep in case a file landed between the scan
+                # above and the process actually exiting, then whatever's
+                # still left either failed or was skipped by --ignore-errors
+                # on audible-cli's side.
+                for asin in list(remaining):
+                    convert_ready(asin)
+                for asin in remaining:
+                    failed.append(by_asin[asin])
+                remaining.clear()
+                break
 
-                matches = sorted(DOWNLOAD_DIR.glob(f"{asin}_*.aax")) + sorted(
-                    DOWNLOAD_DIR.glob(f"{asin}_*.aaxc")
-                )
-                if not matches:
-                    print(f"{progress} ! {title} ({asin}): no file downloaded, will retry later")
-                    failed.append(item)
-                    start_next(executor, in_flight)
-                    continue
+            if not stopped_early and args.min_free_gb:
+                free = _free_gb(DOWNLOAD_DIR)
+                if free < args.min_free_gb:
+                    print(
+                        f"\nOnly {free:.1f} GB free, below --min-free-gb "
+                        f"{args.min_free_gb}. Stopping the download process "
+                        "here. Free up space and re-run this exact command "
+                        "to continue."
+                    )
+                    proc.terminate()
+                    stopped_early = True
 
-                src = matches[0]
-                title_stem = _strip_asin_prefix(src.stem, asin)
-                dest = MP3_DIR / (title_stem + "." + args.format)
-                if dest.exists():
-                    # Two different books slugified down to the same name
-                    # (rare, but possible with near-duplicate titles) -
-                    # disambiguate instead of one overwriting the other.
-                    dest = MP3_DIR / f"{title_stem} ({asin}).{args.format}"
-                print(f"{progress} converting: {src.name}")
-                convert_one(src, dest, activation_bytes, fmt=args.format)
-                if not args.keep_source:
-                    src.unlink(missing_ok=True)
-                done.add(asin)
-                _save_progress(done)
-                start_next(executor, in_flight)
+            time.sleep(POLL_INTERVAL)
+    finally:
+        if proc.poll() is None:
+            proc.wait()
 
     print(f"\nDone for now: {len(done)} of {total} title(s) processed.")
     if failed:
@@ -563,9 +588,9 @@ def main():
         "--jobs",
         type=int,
         default=3,
-        help="How many titles to download at once (default: 3). Each one is converted "
-        "and its .aax deleted the moment its own download finishes, without waiting "
-        "for the others in flight.",
+        help="How many titles audible-cli downloads at once (default: 3). Each one is "
+        "converted and its .aax deleted the moment it lands, without waiting for the "
+        "others still downloading.",
     )
     bt.add_argument(
         "--starts-with",
@@ -582,8 +607,9 @@ def main():
         "--min-free-gb",
         type=float,
         default=2.0,
-        help="Stop starting new downloads (letting ones already in flight finish) if "
-        "free disk space drops below this many GB (default: 2.0). Use 0 to disable.",
+        help="Stop the download process if free disk space drops below this many GB "
+        "(default: 2.0). Anything already converted stays done; whatever was still "
+        "downloading is retried on the next run. Use 0 to disable.",
     )
     bt.set_defaults(func=cmd_batch)
 
