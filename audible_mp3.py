@@ -223,39 +223,24 @@ def _find_downloaded(asin):
     return matches[0] if matches else None
 
 
-def cmd_batch(args):
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-    MP3_DIR.mkdir(exist_ok=True)
-    _cleanup_stale_tmp_artifacts()
-    activation_bytes = get_activation_bytes()
+def _chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
-    library = _fetch_library()
-    if args.starts_with:
-        letter = args.starts_with.upper()
-        library = [i for i in library if _starting_letter(i.get("title", "")) == letter]
 
-    done = _load_progress()
-    pending = [i for i in library if i["asin"] not in done]
-
-    total = len(library)
-    if not pending:
-        print(f"All {total} title(s) already processed (see {PROGRESS_FILE.name}).")
-        return
-
-    print(
-        f"{len(pending)} of {total} title(s) remaining "
-        f"(resuming; {len(done)} already done)."
-    )
-
-    by_asin = {item["asin"]: item for item in pending}
+def _run_wave(wave, args, activation_bytes, done, total):
+    """Download+convert one wave of titles. Converts each the instant it
+    lands rather than waiting on the rest of the wave. Returns
+    (failed_items, stop_requested)."""
+    by_asin = {item["asin"]: item for item in wave}
     remaining = set(by_asin)
 
-    # One audible-cli process for everything pending: audible-cli re-syncs
-    # your whole library on every invocation regardless of --asin, so
-    # spawning a separate process per title (as an earlier version of this
-    # did) paid that cost once per *book* instead of once per *run* -
-    # which is what made --jobs look broken/serial. --jobs here is
-    # audible-cli's own internal concurrency within this one process.
+    # One audible-cli process per wave, not one per title: audible-cli
+    # re-syncs your whole library on every invocation regardless of --asin,
+    # so a separate process per book (as an earlier version of this did)
+    # paid that cost once per *book* instead of once per *wave* - which is
+    # what made --jobs look broken/serial. --jobs here is audible-cli's own
+    # internal concurrency within this one process.
     dl_cmd = [
         "audible",
         "download",
@@ -274,7 +259,7 @@ def cmd_batch(args):
     proc = subprocess.Popen(dl_cmd)
 
     failed = []
-    stopped_early = False
+    stop_requested = False
 
     def convert_ready(asin):
         src = _find_downloaded(asin)
@@ -290,7 +275,16 @@ def cmd_batch(args):
             dest = MP3_DIR / f"{title_stem} ({asin}).{args.format}"
         progress = f"[{len(done) + 1}/{total}]"
         print(f"{progress} converting: {src.name}")
-        convert_one(src, dest, activation_bytes, fmt=args.format)
+        try:
+            convert_one(src, dest, activation_bytes, fmt=args.format)
+        except subprocess.CalledProcessError:
+            # Leave the .aax in place (don't delete a source we failed to
+            # convert) and don't mark it done - one bad file shouldn't take
+            # the whole run down with it.
+            print(f"{progress} ! {src.name}: conversion failed, will retry later")
+            failed.append(item)
+            remaining.discard(asin)
+            return True
         if not args.keep_source:
             src.unlink(missing_ok=True)
         done.add(asin)
@@ -318,22 +312,67 @@ def cmd_batch(args):
                 remaining.clear()
                 break
 
-            if not stopped_early and args.min_free_gb:
+            if args.min_free_gb:
                 free = _free_gb(DOWNLOAD_DIR)
                 if free < args.min_free_gb:
                     print(
                         f"\nOnly {free:.1f} GB free, below --min-free-gb "
-                        f"{args.min_free_gb}. Stopping the download process "
-                        "here. Free up space and re-run this exact command "
-                        "to continue."
+                        f"{args.min_free_gb}. Stopping here. Free up space "
+                        "and re-run this exact command to continue."
                     )
                     proc.terminate()
-                    stopped_early = True
+                    stop_requested = True
 
             time.sleep(POLL_INTERVAL)
     finally:
         if proc.poll() is None:
             proc.wait()
+
+    return failed, stop_requested
+
+
+def cmd_batch(args):
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    MP3_DIR.mkdir(exist_ok=True)
+    _cleanup_stale_tmp_artifacts()
+    activation_bytes = get_activation_bytes()
+
+    library = _fetch_library()
+    if args.starts_with:
+        letter = args.starts_with.upper()
+        library = [i for i in library if _starting_letter(i.get("title", "")) == letter]
+
+    done = _load_progress()
+    pending = [i for i in library if i["asin"] not in done]
+
+    total = len(library)
+    if not pending:
+        print(f"All {total} title(s) already processed (see {PROGRESS_FILE.name}).")
+        return
+
+    print(
+        f"{len(pending)} of {total} title(s) remaining "
+        f"(resuming; {len(done)} already done)."
+    )
+
+    # 0 (or anything <= 0) means "one wave for everything pending" - no
+    # chunking at all. A title is still converted the instant its own
+    # download finishes either way; batch-size only controls how many
+    # titles share one underlying audible-cli process (and therefore one
+    # library sync), and how often --min-free-gb gets rechecked.
+    wave_size = args.batch_size if args.batch_size > 0 else len(pending)
+
+    failed = []
+    for wave_num, wave in enumerate(_chunked(pending, wave_size), start=1):
+        if len(pending) > wave_size:
+            print(f"\n=== Wave {wave_num}: {len(wave)} title(s) ===")
+        wave_failed, stop_requested = _run_wave(wave, args, activation_bytes, done, total)
+        failed.extend(wave_failed)
+        if stop_requested:
+            # Whatever wasn't started yet in this and later waves is simply
+            # still pending (not in `done`), so it's picked up automatically
+            # on the next run.
+            break
 
     print(f"\nDone for now: {len(done)} of {total} title(s) processed.")
     if failed:
@@ -387,7 +426,12 @@ def convert_one(src, dest, activation_bytes, fmt="mp3"):
         final_muxer = "mp3"
     elif fmt == "m4b":
         audio_codec_args = ["-c:a", "copy"]
-        audio_container = "adts"
+        # Not "adts": some audiobooks use an AAC profile (HE-AAC/SBR) that
+        # bare ADTS can't represent ("Scalable configurations are not
+        # allowed in ADTS"), so the copy fails outright. ipod/mp4 can hold
+        # any AAC profile losslessly via explicit config - same muxer the
+        # final pass already uses successfully.
+        audio_container = "ipod"
         final_muxer = "ipod"
     else:
         raise ValueError(f"Unsupported format: {fmt}")
@@ -563,10 +607,11 @@ def main():
     bt = sub.add_parser(
         "batch",
         help=(
-            "Download+convert titles one at a time (or --jobs at a time), "
-            "converting each as soon as its own download finishes instead of "
-            "waiting on the others, and deleting each .aax right after. Safe "
-            "to stop (Ctrl-C) and re-run to continue where it left off."
+            "Download+convert titles in waves of --batch-size, converting "
+            "each one the instant its own download finishes instead of "
+            "waiting on the rest of the wave, and deleting each .aax right "
+            "after. Safe to stop (Ctrl-C) and re-run to continue where it "
+            "left off."
         ),
     )
     bt.add_argument(
@@ -576,6 +621,15 @@ def main():
         help="How many titles audible-cli downloads at once (default: 3). Each one is "
         "converted and its .aax deleted the moment it lands, without waiting for the "
         "others still downloading.",
+    )
+    bt.add_argument(
+        "--batch-size",
+        type=int,
+        default=25,
+        help="How many titles share one underlying audible-cli process (default: 25). "
+        "0 processes everything pending in a single wave. A title is still converted "
+        "the instant its own download finishes either way - this only controls how "
+        "often the library gets re-synced and --min-free-gb rechecked.",
     )
     bt.add_argument(
         "--starts-with",

@@ -189,27 +189,28 @@ Pick per-command, e.g. `python audible_mp3.py batch --format m4b`.
 for a big library the `.aax` files for the *whole* batch have to fit on
 disk at once — not realistic for, say, 840 books on a laptop drive.
 
-`batch` instead runs one `audible download` process for everything
-pending (`--jobs` controls audible-cli's own internal download
-concurrency within that process) and polls for finished files, converting
-and deleting each book's `.aax` the moment it lands — it never waits for
-the others still downloading before converting a book that's already
-done. It's deliberately *one* process rather than one per book: audible-cli
-re-syncs your whole library on every invocation it runs, so spawning a
-separate process per title would pay that cost 840 times over instead of
-once, which in practice looks like downloads stalling or `--jobs` doing
-nothing. Progress is tracked in `downloads/.sync_progress.json`, so if
-it's interrupted (Ctrl-C, a reboot, running out of space anyway) you can
-just re-run the exact same command and it skips everything already
-converted and picks up where it stopped — no need to track which books
-are done yourself. A title whose download fails is skipped (logged at the
-end) and simply retried on the next run, instead of aborting the whole
-thing.
+`batch` instead works through pending titles in waves of `--batch-size`
+(default 25): one `audible download` process per wave (`--jobs` controls
+audible-cli's own internal download concurrency within that process),
+polling for finished files and converting+deleting each book's `.aax`
+the moment it lands — it never waits for the rest of the wave before
+converting a book that's already done. Waves exist so one underlying
+audible-cli process doesn't have to cover the entire library at once:
+audible-cli re-syncs your whole library on every invocation it runs, so
+a *separate process per title* (which an earlier version of this did)
+pays that cost once per book instead of once per wave — in practice that
+looked like downloads stalling or `--jobs` doing nothing. Progress is
+tracked in `downloads/.sync_progress.json`, so if it's interrupted
+(Ctrl-C, a reboot, running out of space anyway) you can just re-run the
+exact same command and it skips everything already converted and picks
+up where it stopped — no need to track which books are done yourself. A
+title whose download fails is skipped (logged at the end) and simply
+retried on the next run, instead of aborting the whole thing.
 
 ```bash
-# 3 downloads in flight at once, refusing to start a new one once
-# free space drops under 5 GB
-python audible_mp3.py batch --jobs 3 --min-free-gb 5
+# Waves of 25 titles, 3 downloads in flight at once, stopping before
+# a wave that might not fit once free space drops under 5 GB
+python audible_mp3.py batch --batch-size 25 --jobs 3 --min-free-gb 5
 
 # Only the "A" titles this round
 python audible_mp3.py batch --starts-with A
@@ -218,15 +219,20 @@ python audible_mp3.py batch --starts-with A
 python audible_mp3.py batch --keep-source
 ```
 
-Tune `--jobs` to how much headroom you actually have: if a book's `.aax`
-plus its converted `.mp3` run to ~1 GB combined, `--jobs 3` needs roughly
-3 GB free at any one time, regardless of how many hundreds of books are
-left overall (an in-progress download disappears the moment it finishes
-and gets converted — it doesn't pile up). `--min-free-gb` is a safety
-margin on top of that — it stops the whole download process once free
+`--batch-size` is mostly about amortizing that library re-sync and giving
+`--min-free-gb` a natural checkpoint between waves — it does *not* gate
+conversion the way an old version of this flag used to; a title converts
+the moment its own download finishes regardless of wave size. `0` turns
+chunking off entirely (one wave for everything pending). Tune `--jobs` to
+how much disk headroom you actually have: if a book's `.aax` plus its
+converted `.mp3` run to ~1 GB combined, `--jobs 3` needs roughly 3 GB free
+at any one time, regardless of how many hundreds of books are left overall
+(an in-progress download disappears the moment it finishes and gets
+converted — it doesn't pile up). `--min-free-gb` is a safety margin on
+top of that — it stops the current wave's download process once free
 space drops too low, rather than letting it run until something actually
-fails. Anything already converted at that point stays done; whatever
-was still downloading just gets retried on the next run.
+fails. Anything already converted at that point stays done; whatever was
+still downloading, or any later wave, just gets retried on the next run.
 
 **How "already done" is tracked.** Each title counts as done only once
 it's been fully *converted* — a book that only got partway through
@@ -264,7 +270,7 @@ container runs just like the downloaded files do).
 | `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--starts-with LETTER` — only titles starting with this letter (leading "a"/"an"/"the" is ignored, e.g. *The Hobbit* counts as "H"); `--jobs N` — simultaneous downloads (default `3`); `--strict` — abort on the first title that fails instead of the default of skipping it and continuing. |
 | `convert` | Converts every `.aax`/`.aaxc` file in `./downloads` to MP3 (or M4B) in `./mp3`, with a progress bar per file. | `--format {mp3,m4b}` — see [Output format: MP3 vs M4B](#output-format-mp3-vs-m4b) (default `mp3`); `--force` — re-convert even if an output file with that name already exists (default: skip). |
 | `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--starts-with`, `--jobs`, `--strict`, `--format`, `--force`). |
-| `batch` | Keeps up to `--jobs` downloads in flight, converting (and deleting the `.aax` of) each one the instant its own download finishes rather than waiting on the others, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off; a failed title is logged and retried next run instead of aborting everything. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--jobs N` — downloads in flight at once (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop the download process if free space drops below this (default `2.0`, `0` disables). |
+| `batch` | Works through pending titles in waves of `--batch-size`, keeping up to `--jobs` downloads in flight per wave and converting (and deleting the `.aax` of) each one the instant its own download finishes rather than waiting on the rest of the wave, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off; a failed title is logged and retried next run instead of aborting everything. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--batch-size N` — titles per wave (default `25`, `0` = one wave for everything pending); `--jobs N` — downloads in flight per wave (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop the current wave if free space drops below this (default `2.0`, `0` disables). |
 
 Run `python audible_mp3.py <command> --help` (or
 `docker compose run --rm audible-mp3 <command> --help`) for the same
