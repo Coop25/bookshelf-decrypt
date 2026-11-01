@@ -213,7 +213,33 @@ Tune `--batch-size` to how much headroom you actually have: if a book's
 needs roughly 5 GB free at any one time, regardless of how many hundreds
 of books are left overall. `--min-free-gb` is a safety margin on top of
 that — it stops the run *before* starting a batch that might not fit,
-rather than failing partway through a download.
+rather than failing partway through a download. `--batch-size 0` turns
+chunking off entirely and processes everything still pending in one go —
+useful if disk space isn't actually tight and you'd rather just blow
+through the whole run, but note it brings back `sync`'s disk-usage
+profile (nothing gets cleaned up until every download in the run has
+finished).
+
+**How "already done" is tracked.** Each title counts as done only once
+it's been fully *converted* — a book that only got partway through
+downloading is not marked done, so a crash or Ctrl-C mid-download simply
+means that title gets attempted again next time. audible-cli itself
+handles the actual resume: a large partial download picks up via an HTTP
+range request instead of restarting from zero, and a file that's already
+fully downloaded just gets skipped outright, not re-fetched. A title
+getting killed mid-*conversion* is also safe: the half-written output
+lives under a `.tmp` name the whole time and is only renamed to the real
+filename on success, so an interrupted run never leaves a broken file
+sitting under the real name — and any stale `.tmp` leftovers from a hard
+kill get swept up automatically the next time `batch` or `convert` starts.
+
+**Moving files around.** It's safe to move or back up anything already
+converted in `./mp3` — resuming only checks ASINs against
+`downloads/.sync_progress.json`, never whether the converted file still
+physically exists there. It is *not* safe to move a `.aax`/`.aaxc` out of
+`./downloads` before it's been converted, though — `batch` finds the file
+to convert by looking for it there, and if it's gone, `batch` will just
+download that title again.
 
 To start over from scratch, delete `downloads/.sync_progress.json`
 (`docker compose run --rm audible-mp3` doesn't need anything special —
@@ -230,7 +256,7 @@ container runs just like the downloaded files do).
 | `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--starts-with LETTER` — only titles starting with this letter (leading "a"/"an"/"the" is ignored, e.g. *The Hobbit* counts as "H"); `--jobs N` — simultaneous downloads (default `3`); `--ignore-errors` — skip titles that fail instead of aborting the whole batch. |
 | `convert` | Converts every `.aax`/`.aaxc` file in `./downloads` to MP3 (or M4B) in `./mp3`, with a progress bar per file. | `--format {mp3,m4b}` — see [Output format: MP3 vs M4B](#output-format-mp3-vs-m4b) (default `mp3`); `--force` — re-convert even if an output file with that name already exists (default: skip). |
 | `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--starts-with`, `--jobs`, `--ignore-errors`, `--format`, `--force`). |
-| `batch` | Downloads+converts a few titles at a time, deleting each `.aax` once it's converted, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--batch-size N` — titles per batch (default `5`); `--jobs N` — parallel downloads within a batch (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop before a batch if free space drops below this (default `2.0`, `0` disables); `--ignore-errors`. |
+| `batch` | Downloads+converts a few titles at a time, deleting each `.aax` once it's converted, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--batch-size N` — titles per batch (default `5`, `0` = no chunking, process everything pending in one go); `--jobs N` — parallel downloads within a batch (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop before a batch if free space drops below this (default `2.0`, `0` disables); `--ignore-errors`. |
 
 Run `python audible_mp3.py <command> --help` (or
 `docker compose run --rm audible-mp3 <command> --help`) for the same

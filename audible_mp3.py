@@ -197,9 +197,30 @@ def _free_gb(path):
     return shutil.disk_usage(path).free / (1024**3)
 
 
+def _strip_asin_prefix(stem, asin):
+    # audible-cli's "asin_ascii" filename mode names files "{asin}_{title}".
+    # We download that way so batch can reliably match a file back to the
+    # ASIN it requested, but the ASIN is just plumbing - the converted
+    # output should read as the book's title, not a product code.
+    prefix = asin + "_"
+    return stem[len(prefix):] if stem.startswith(prefix) else stem
+
+
+def _cleanup_stale_tmp_artifacts():
+    # Leftovers from a convert_one() that got hard-killed (not Ctrl-C, which
+    # it already cleans up after itself via its own finally block) mid-run.
+    # Always safe to remove: these are intermediate files, never the final
+    # output, and the next run that touches the same book overwrites them
+    # with -y anyway.
+    for pattern in ("*.tmp", "*.audio.tmp"):
+        for stale in MP3_DIR.glob(pattern):
+            stale.unlink(missing_ok=True)
+
+
 def cmd_batch(args):
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     MP3_DIR.mkdir(exist_ok=True)
+    _cleanup_stale_tmp_artifacts()
     activation_bytes = get_activation_bytes()
 
     library = _fetch_library()
@@ -220,7 +241,12 @@ def cmd_batch(args):
         f"(resuming; {len(done)} already done)."
     )
 
-    for batch_num, chunk in enumerate(_chunked(pending, args.batch_size), start=1):
+    # 0 (or anything <= 0) means "don't chunk, just run through everything
+    # pending" -- note this brings back sync's disk-usage profile, since
+    # nothing gets cleaned up until every download in the run has finished.
+    batch_size = args.batch_size if args.batch_size > 0 else len(pending)
+
+    for batch_num, chunk in enumerate(_chunked(pending, batch_size), start=1):
         if args.min_free_gb:
             free = _free_gb(DOWNLOAD_DIR)
             if free < args.min_free_gb:
@@ -259,7 +285,13 @@ def cmd_batch(args):
                 print(f"  ! {asin} ({title}): no file downloaded, skipping for now")
                 continue
             src = matches[0]
-            dest = MP3_DIR / (src.stem + "." + args.format)
+            title_stem = _strip_asin_prefix(src.stem, asin)
+            dest = MP3_DIR / (title_stem + "." + args.format)
+            if dest.exists():
+                # Two different books slugified down to the same name (rare,
+                # but possible e.g. with near-duplicate titles) - disambiguate
+                # instead of one silently overwriting the other.
+                dest = MP3_DIR / f"{title_stem} ({asin}).{args.format}"
             print(f"  converting: {src.name}")
             convert_one(src, dest, activation_bytes, fmt=args.format)
             if not args.keep_source:
@@ -403,6 +435,7 @@ def convert_one(src, dest, activation_bytes, fmt="mp3"):
 
 def cmd_convert(args):
     MP3_DIR.mkdir(exist_ok=True)
+    _cleanup_stale_tmp_artifacts()
     activation_bytes = get_activation_bytes()
     aax_files = sorted(DOWNLOAD_DIR.glob("*.aax")) + sorted(DOWNLOAD_DIR.glob("*.aaxc"))
     if not aax_files:
@@ -498,7 +531,10 @@ def main():
         "--batch-size",
         type=int,
         default=5,
-        help="How many titles to download+convert before moving to the next batch (default: 5).",
+        help="How many titles to download+convert before moving to the next batch "
+        "(default: 5). 0 processes everything pending in one go, ignoring the "
+        "batch size (same disk-usage profile as `sync`, since nothing gets "
+        "cleaned up until every download in the run has finished).",
     )
     bt.add_argument(
         "--jobs", type=int, default=3, help="Simultaneous downloads within each batch (default: 3)."
