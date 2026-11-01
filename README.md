@@ -156,9 +156,10 @@ python audible_mp3.py sync
 # Just want the activation bytes (e.g. to use with ffmpeg yourself)?
 python audible_mp3.py activation-bytes
 
-# Large library, small disk: download+convert a few at a time, deleting
-# each .aax right after it's converted, and safe to stop/re-run.
-python audible_mp3.py batch --batch-size 5
+# Large library, small disk: download a few at a time, converting (and
+# deleting) each one the moment its own download finishes, and safe to
+# stop/re-run.
+python audible_mp3.py batch --jobs 3
 ```
 
 With Docker, prefix each command with `docker compose run --rm
@@ -188,37 +189,37 @@ Pick per-command, e.g. `python audible_mp3.py batch --format m4b`.
 for a big library the `.aax` files for the *whole* batch have to fit on
 disk at once — not realistic for, say, 840 books on a laptop drive.
 
-`batch` instead processes a handful of titles at a time: download a small
-batch, convert each one to MP3, delete its `.aax` to free the space back
-up, then move on to the next batch. Progress is tracked in
+`batch` instead keeps at most `--jobs` downloads in flight at once, and as
+soon as any *one* of them finishes, converts that book and deletes its
+`.aax` immediately — it never waits for the others still downloading
+before converting a book that's already done. Progress is tracked in
 `downloads/.sync_progress.json`, so if it's interrupted (Ctrl-C, a reboot,
 running out of space anyway) you can just re-run the exact same command and
 it skips everything already converted and picks up where it stopped —
-no need to track which books are done yourself.
+no need to track which books are done yourself. A title whose download
+fails is skipped (logged at the end) and simply retried on the next run,
+instead of aborting the whole thing.
 
 ```bash
-# Process 5 titles at a time, 3 downloads in parallel per batch,
-# and refuse to start a new batch with less than 5 GB free
-python audible_mp3.py batch --batch-size 5 --jobs 3 --min-free-gb 5
+# 3 downloads in flight at once, refusing to start a new one once
+# free space drops under 5 GB
+python audible_mp3.py batch --jobs 3 --min-free-gb 5
 
-# Only the "A" titles this round (combine with --batch-size as needed)
+# Only the "A" titles this round
 python audible_mp3.py batch --starts-with A
 
 # Keep the original .aax files around instead of deleting them after conversion
 python audible_mp3.py batch --keep-source
 ```
 
-Tune `--batch-size` to how much headroom you actually have: if a book's
-`.aax` plus its converted `.mp3` run to ~1 GB combined, `--batch-size 5`
-needs roughly 5 GB free at any one time, regardless of how many hundreds
-of books are left overall. `--min-free-gb` is a safety margin on top of
-that — it stops the run *before* starting a batch that might not fit,
-rather than failing partway through a download. `--batch-size 0` turns
-chunking off entirely and processes everything still pending in one go —
-useful if disk space isn't actually tight and you'd rather just blow
-through the whole run, but note it brings back `sync`'s disk-usage
-profile (nothing gets cleaned up until every download in the run has
-finished).
+Tune `--jobs` to how much headroom you actually have: if a book's `.aax`
+plus its converted `.mp3` run to ~1 GB combined, `--jobs 3` needs roughly
+3 GB free at any one time, regardless of how many hundreds of books are
+left overall (an in-progress download disappears the moment it finishes
+and gets converted — it doesn't pile up). `--min-free-gb` is a safety
+margin on top of that — it stops *new* downloads from starting (letting
+whatever's already in flight finish normally) rather than failing
+partway through one.
 
 **How "already done" is tracked.** Each title counts as done only once
 it's been fully *converted* — a book that only got partway through
@@ -253,10 +254,10 @@ container runs just like the downloaded files do).
 | `login` | Runs `audible quickstart` (one-time OAuth setup). | — |
 | `logout` | Clears your audible-cli login and cached activation bytes, and double-checks with a real audible-cli request that no credentials remain, so `login` can be run fresh. See [below](#logging-out--switching-accounts). | — |
 | `activation-bytes` | Prints your account's activation bytes, fetching and caching them on first use. | `--refresh` — ignore the cache and re-fetch from audible-cli. |
-| `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--starts-with LETTER` — only titles starting with this letter (leading "a"/"an"/"the" is ignored, e.g. *The Hobbit* counts as "H"); `--jobs N` — simultaneous downloads (default `3`); `--ignore-errors` — skip titles that fail instead of aborting the whole batch. |
+| `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--starts-with LETTER` — only titles starting with this letter (leading "a"/"an"/"the" is ignored, e.g. *The Hobbit* counts as "H"); `--jobs N` — simultaneous downloads (default `3`); `--strict` — abort on the first title that fails instead of the default of skipping it and continuing. |
 | `convert` | Converts every `.aax`/`.aaxc` file in `./downloads` to MP3 (or M4B) in `./mp3`, with a progress bar per file. | `--format {mp3,m4b}` — see [Output format: MP3 vs M4B](#output-format-mp3-vs-m4b) (default `mp3`); `--force` — re-convert even if an output file with that name already exists (default: skip). |
-| `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--starts-with`, `--jobs`, `--ignore-errors`, `--format`, `--force`). |
-| `batch` | Downloads+converts a few titles at a time, deleting each `.aax` once it's converted, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--batch-size N` — titles per batch (default `5`, `0` = no chunking, process everything pending in one go); `--jobs N` — parallel downloads within a batch (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop before a batch if free space drops below this (default `2.0`, `0` disables); `--ignore-errors`. |
+| `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--starts-with`, `--jobs`, `--strict`, `--format`, `--force`). |
+| `batch` | Keeps up to `--jobs` downloads in flight, converting (and deleting the `.aax` of) each one the instant its own download finishes rather than waiting on the others, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off; a failed title is logged and retried next run instead of aborting everything. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--jobs N` — downloads in flight at once (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop starting new downloads if free space drops below this (default `2.0`, `0` disables). |
 
 Run `python audible_mp3.py <command> --help` (or
 `docker compose run --rm audible-mp3 <command> --help`) for the same
@@ -316,10 +317,12 @@ nothing to remove instead of pretending it did something.
 - **`ffmpeg: command not found` (local Python install).** Install ffmpeg
   and make sure it's on your `PATH`; restart your terminal afterward. Or
   switch to the Docker setup, which bundles it.
-- **A title fails to download.** Re-run with `--ignore-errors` to skip it
-  and continue with the rest of the batch; investigate the specific title
-  with `python audible_mp3.py download --asin <that ASIN>` to see the full
-  error.
+- **A title fails to download.** `download`/`sync`/`batch` all skip a
+  failing title and continue with the rest by default — audible-cli still
+  prints the underlying error to the terminal, it just isn't fatal to the
+  run. Investigate the specific title with `python audible_mp3.py download
+  --asin <that ASIN>`; add `--strict` there if you also want this script
+  to exit non-zero on that failure instead of continuing past it.
 - **Conversion progress bar is stuck at 0%.** This is the exact problem
   `convert_one()` works around (see [How it works](#how-it-works)); if you
   still see it, the file's audio stream may not be mapped the way the

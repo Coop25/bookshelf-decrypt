@@ -7,6 +7,7 @@ around audible-cli (for auth/download) and ffmpeg (for decrypt+transcode).
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -164,7 +165,7 @@ def cmd_download(args):
     else:
         cmd += ["--all"]
     cmd += ["--jobs", str(args.jobs)]
-    if args.ignore_errors:
+    if not args.strict:
         cmd.append("--ignore-errors")
     run(cmd)
 
@@ -186,11 +187,6 @@ def _load_progress():
 
 def _save_progress(done_asins):
     PROGRESS_FILE.write_text(json.dumps(sorted(done_asins), indent=2))
-
-
-def _chunked(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
 
 
 def _free_gb(path):
@@ -217,6 +213,23 @@ def _cleanup_stale_tmp_artifacts():
             stale.unlink(missing_ok=True)
 
 
+def _download_single(asin):
+    cmd = [
+        "audible",
+        "download",
+        "--output-dir",
+        str(DOWNLOAD_DIR),
+        "--aax",
+        "--filename-mode",
+        "asin_ascii",
+        "--asin",
+        asin,
+    ]
+    print("$", " ".join(cmd))
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
 def cmd_batch(args):
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     MP3_DIR.mkdir(exist_ok=True)
@@ -241,65 +254,82 @@ def cmd_batch(args):
         f"(resuming; {len(done)} already done)."
     )
 
-    # 0 (or anything <= 0) means "don't chunk, just run through everything
-    # pending" -- note this brings back sync's disk-usage profile, since
-    # nothing gets cleaned up until every download in the run has finished.
-    batch_size = args.batch_size if args.batch_size > 0 else len(pending)
+    failed = []
+    stopped_early = False
+    next_index = 0
+    max_workers = max(1, args.jobs)
 
-    for batch_num, chunk in enumerate(_chunked(pending, batch_size), start=1):
+    def start_next(executor, in_flight):
+        nonlocal next_index, stopped_early
+        if stopped_early or next_index >= len(pending):
+            return
         if args.min_free_gb:
             free = _free_gb(DOWNLOAD_DIR)
             if free < args.min_free_gb:
                 print(
-                    f"Only {free:.1f} GB free, below --min-free-gb {args.min_free_gb}. "
-                    "Stopping here so the disk doesn't fill up. Free up space, then "
-                    "re-run this exact command to pick up where it left off."
+                    f"\nOnly {free:.1f} GB free, below --min-free-gb {args.min_free_gb}. "
+                    "Not starting any new downloads. Letting in-flight ones finish, "
+                    "then stop. Free up space and re-run this exact command to "
+                    "continue."
                 )
-                sys.exit(1)
+                stopped_early = True
+                return
+        item = pending[next_index]
+        next_index += 1
+        future = executor.submit(_download_single, item["asin"])
+        in_flight[future] = item
 
-        print(f"\n=== Batch {batch_num}: {len(chunk)} title(s) ===")
-        dl_cmd = [
-            "audible",
-            "download",
-            "--output-dir",
-            str(DOWNLOAD_DIR),
-            "--aax",
-            "--filename-mode",
-            "asin_ascii",
-            "--jobs",
-            str(args.jobs),
-        ]
-        if args.ignore_errors:
-            dl_cmd.append("--ignore-errors")
-        for item in chunk:
-            dl_cmd += ["--asin", item["asin"]]
-        run(dl_cmd)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        in_flight = {}
+        for _ in range(max_workers):
+            start_next(executor, in_flight)
 
-        for item in chunk:
-            asin = item["asin"]
-            title = item.get("title", asin)
-            matches = sorted(DOWNLOAD_DIR.glob(f"{asin}_*.aax")) + sorted(
-                DOWNLOAD_DIR.glob(f"{asin}_*.aaxc")
+        while in_flight:
+            finished, _ = concurrent.futures.wait(
+                in_flight, return_when=concurrent.futures.FIRST_COMPLETED
             )
-            if not matches:
-                print(f"  ! {asin} ({title}): no file downloaded, skipping for now")
-                continue
-            src = matches[0]
-            title_stem = _strip_asin_prefix(src.stem, asin)
-            dest = MP3_DIR / (title_stem + "." + args.format)
-            if dest.exists():
-                # Two different books slugified down to the same name (rare,
-                # but possible e.g. with near-duplicate titles) - disambiguate
-                # instead of one silently overwriting the other.
-                dest = MP3_DIR / f"{title_stem} ({asin}).{args.format}"
-            print(f"  converting: {src.name}")
-            convert_one(src, dest, activation_bytes, fmt=args.format)
-            if not args.keep_source:
-                src.unlink(missing_ok=True)
-            done.add(asin)
-            _save_progress(done)
+            for future in finished:
+                item = in_flight.pop(future)
+                asin = item["asin"]
+                title = item.get("title", asin)
+                progress = f"[{len(done) + len(failed) + 1}/{total}]"
+
+                if not future.result():
+                    print(f"{progress} ! {title} ({asin}): download failed, will retry later")
+                    failed.append(item)
+                    start_next(executor, in_flight)
+                    continue
+
+                matches = sorted(DOWNLOAD_DIR.glob(f"{asin}_*.aax")) + sorted(
+                    DOWNLOAD_DIR.glob(f"{asin}_*.aaxc")
+                )
+                if not matches:
+                    print(f"{progress} ! {title} ({asin}): no file downloaded, will retry later")
+                    failed.append(item)
+                    start_next(executor, in_flight)
+                    continue
+
+                src = matches[0]
+                title_stem = _strip_asin_prefix(src.stem, asin)
+                dest = MP3_DIR / (title_stem + "." + args.format)
+                if dest.exists():
+                    # Two different books slugified down to the same name
+                    # (rare, but possible with near-duplicate titles) -
+                    # disambiguate instead of one overwriting the other.
+                    dest = MP3_DIR / f"{title_stem} ({asin}).{args.format}"
+                print(f"{progress} converting: {src.name}")
+                convert_one(src, dest, activation_bytes, fmt=args.format)
+                if not args.keep_source:
+                    src.unlink(missing_ok=True)
+                done.add(asin)
+                _save_progress(done)
+                start_next(executor, in_flight)
 
     print(f"\nDone for now: {len(done)} of {total} title(s) processed.")
+    if failed:
+        print(f"{len(failed)} title(s) failed and will be retried next run:")
+        for item in failed:
+            print(f"  {item['asin']}  {item.get('title', '')}")
     if len(done) < total:
         print("Re-run the same command to continue with the rest.")
 
@@ -484,9 +514,10 @@ def main():
     )
     dl.add_argument("--jobs", type=int, default=3, help="Simultaneous downloads (default: 3).")
     dl.add_argument(
-        "--ignore-errors",
+        "--strict",
         action="store_true",
-        help="Don't abort the whole batch if one title fails; skip it and continue.",
+        help="Abort the whole run on the first title that fails, instead of the "
+        "default of skipping it and continuing with the rest.",
     )
     dl.set_defaults(func=cmd_download)
 
@@ -512,32 +543,29 @@ def main():
     sy.add_argument("--format", choices=["mp3", "m4b"], default="mp3", help=format_help)
     sy.add_argument("--jobs", type=int, default=3, help="Simultaneous downloads (default: 3).")
     sy.add_argument(
-        "--ignore-errors",
+        "--strict",
         action="store_true",
-        help="Don't abort the whole batch if one title fails; skip it and continue.",
+        help="Abort the whole run on the first title that fails, instead of the "
+        "default of skipping it and continuing with the rest.",
     )
     sy.set_defaults(func=cmd_sync)
 
     bt = sub.add_parser(
         "batch",
         help=(
-            "Download+convert in small batches, deleting each .aax after it's "
-            "converted, so the disk never has to hold more than --batch-size "
-            "books at once. Safe to stop (Ctrl-C) and re-run to continue where "
-            "it left off."
+            "Download+convert titles one at a time (or --jobs at a time), "
+            "converting each as soon as its own download finishes instead of "
+            "waiting on the others, and deleting each .aax right after. Safe "
+            "to stop (Ctrl-C) and re-run to continue where it left off."
         ),
     )
     bt.add_argument(
-        "--batch-size",
+        "--jobs",
         type=int,
-        default=5,
-        help="How many titles to download+convert before moving to the next batch "
-        "(default: 5). 0 processes everything pending in one go, ignoring the "
-        "batch size (same disk-usage profile as `sync`, since nothing gets "
-        "cleaned up until every download in the run has finished).",
-    )
-    bt.add_argument(
-        "--jobs", type=int, default=3, help="Simultaneous downloads within each batch (default: 3)."
+        default=3,
+        help="How many titles to download at once (default: 3). Each one is converted "
+        "and its .aax deleted the moment its own download finishes, without waiting "
+        "for the others in flight.",
     )
     bt.add_argument(
         "--starts-with",
@@ -554,13 +582,8 @@ def main():
         "--min-free-gb",
         type=float,
         default=2.0,
-        help="Stop before starting a batch if free disk space drops below this many GB "
-        "(default: 2.0). Use 0 to disable the check.",
-    )
-    bt.add_argument(
-        "--ignore-errors",
-        action="store_true",
-        help="Don't abort the whole run if one title fails; skip it and continue.",
+        help="Stop starting new downloads (letting ones already in flight finish) if "
+        "free disk space drops below this many GB (default: 2.0). Use 0 to disable.",
     )
     bt.set_defaults(func=cmd_batch)
 
