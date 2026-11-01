@@ -22,6 +22,8 @@ happens entirely inside `audible-cli`.
 - [Setup](#setup)
 - [One-time login](#one-time-login)
 - [Usage](#usage)
+  - [Output format: MP3 vs M4B](#output-format-mp3-vs-m4b)
+  - [Large libraries / limited disk space](#large-libraries--limited-disk-space)
 - [Command reference](#command-reference)
 - [File layout](#file-layout)
 - [Logging out / switching accounts](#logging-out--switching-accounts)
@@ -60,12 +62,15 @@ intended for redistributing audiobooks you don't own.
    your account/device, and caches it locally in `.activation_bytes` so
    it isn't re-fetched on every conversion.
 4. `convert` runs `ffmpeg` twice per file:
-   - First pass transcodes audio only (so ffmpeg's progress reporting,
-     which otherwise locks onto the single embedded cover-art "frame" and
-     gets stuck at 0%, tracks correctly).
+   - First pass handles audio only (so ffmpeg's progress reporting, which
+     otherwise locks onto the single embedded cover-art "frame" and gets
+     stuck at 0%, tracks correctly). For MP3 (the default, `--format mp3`)
+     this transcodes to `libmp3lame`; for `--format m4b` it's a lossless
+     copy, since Audible's own audio is already AAC.
    - Second pass is a fast stream-copy remux that reattaches cover art,
      metadata and chapter markers from the original file.
-   Output lands in `./mp3`.
+   Output lands in `./mp3` either way (see [Output format: MP3 vs
+   M4B](#output-format-mp3-vs-m4b)).
 
 ## Setup
 
@@ -136,19 +141,84 @@ python audible_mp3.py download
 # Or just one title by ASIN (find it on the book's Audible product page)
 python audible_mp3.py download --asin B0XXXXXXXX
 
+# Or every title whose name starts with a given letter
+python audible_mp3.py download --starts-with A
+
 # Convert everything in ./downloads to MP3 in ./mp3
 python audible_mp3.py convert
+
+# Or convert to M4B instead (lossless, keeps chapters as their own markers)
+python audible_mp3.py convert --format m4b
 
 # Or do both in one go
 python audible_mp3.py sync
 
 # Just want the activation bytes (e.g. to use with ffmpeg yourself)?
 python audible_mp3.py activation-bytes
+
+# Large library, small disk: download+convert a few at a time, deleting
+# each .aax right after it's converted, and safe to stop/re-run.
+python audible_mp3.py batch --batch-size 5
 ```
 
 With Docker, prefix each command with `docker compose run --rm
 audible-mp3` instead of `python audible_mp3.py`, e.g.
 `docker compose run --rm audible-mp3 sync`.
+
+### Output format: MP3 vs M4B
+
+`convert`, `sync` and `batch` all take `--format mp3` (the default) or
+`--format m4b`:
+
+- **mp3** re-encodes the audio through `libmp3lame`. Slower (it's a real
+  transcode) and technically lossy, but MP3 plays absolutely everywhere.
+- **m4b** is a lossless remux — Audible's own audio is already AAC, so
+  this just copies it into an `.m4b` container instead of re-encoding it.
+  Faster, smaller/same size for the same quality, and M4B's chapter atoms
+  are what most audiobook apps (e.g. a phone's Books/Audiobooks app) use
+  for chapter navigation and remembering playback position per book. Needs
+  a player that understands M4B, which is nearly everything built for
+  audiobooks/podcasts — just not universal like MP3.
+
+Pick per-command, e.g. `python audible_mp3.py batch --format m4b`.
+
+### Large libraries / limited disk space
+
+`sync` (and `download`) pull everything down first and convert after, so
+for a big library the `.aax` files for the *whole* batch have to fit on
+disk at once — not realistic for, say, 840 books on a laptop drive.
+
+`batch` instead processes a handful of titles at a time: download a small
+batch, convert each one to MP3, delete its `.aax` to free the space back
+up, then move on to the next batch. Progress is tracked in
+`downloads/.sync_progress.json`, so if it's interrupted (Ctrl-C, a reboot,
+running out of space anyway) you can just re-run the exact same command and
+it skips everything already converted and picks up where it stopped —
+no need to track which books are done yourself.
+
+```bash
+# Process 5 titles at a time, 3 downloads in parallel per batch,
+# and refuse to start a new batch with less than 5 GB free
+python audible_mp3.py batch --batch-size 5 --jobs 3 --min-free-gb 5
+
+# Only the "A" titles this round (combine with --batch-size as needed)
+python audible_mp3.py batch --starts-with A
+
+# Keep the original .aax files around instead of deleting them after conversion
+python audible_mp3.py batch --keep-source
+```
+
+Tune `--batch-size` to how much headroom you actually have: if a book's
+`.aax` plus its converted `.mp3` run to ~1 GB combined, `--batch-size 5`
+needs roughly 5 GB free at any one time, regardless of how many hundreds
+of books are left overall. `--min-free-gb` is a safety margin on top of
+that — it stops the run *before* starting a batch that might not fit,
+rather than failing partway through a download.
+
+To start over from scratch, delete `downloads/.sync_progress.json`
+(`docker compose run --rm audible-mp3` doesn't need anything special —
+that file lives under the mounted `./downloads`, so it survives between
+container runs just like the downloaded files do).
 
 ## Command reference
 
@@ -157,9 +227,10 @@ audible-mp3` instead of `python audible_mp3.py`, e.g.
 | `login` | Runs `audible quickstart` (one-time OAuth setup). | — |
 | `logout` | Clears your audible-cli login and cached activation bytes, and double-checks with a real audible-cli request that no credentials remain, so `login` can be run fresh. See [below](#logging-out--switching-accounts). | — |
 | `activation-bytes` | Prints your account's activation bytes, fetching and caching them on first use. | `--refresh` — ignore the cache and re-fetch from audible-cli. |
-| `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--jobs N` — simultaneous downloads (default `3`); `--ignore-errors` — skip titles that fail instead of aborting the whole batch. |
-| `convert` | Converts every `.aax`/`.aaxc` file in `./downloads` to MP3 in `./mp3`, with a progress bar per file. | `--force` — re-convert even if an MP3 with that name already exists (default: skip). |
-| `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--jobs`, `--ignore-errors`, `--force`). |
+| `download` | Downloads purchased `.aax` files into `./downloads`. | `--asin ASIN` — only this title (omit to download everything); `--starts-with LETTER` — only titles starting with this letter (leading "a"/"an"/"the" is ignored, e.g. *The Hobbit* counts as "H"); `--jobs N` — simultaneous downloads (default `3`); `--ignore-errors` — skip titles that fail instead of aborting the whole batch. |
+| `convert` | Converts every `.aax`/`.aaxc` file in `./downloads` to MP3 (or M4B) in `./mp3`, with a progress bar per file. | `--format {mp3,m4b}` — see [Output format: MP3 vs M4B](#output-format-mp3-vs-m4b) (default `mp3`); `--force` — re-convert even if an output file with that name already exists (default: skip). |
+| `sync` | Runs `download` then `convert` back to back. | All of `download`'s and `convert`'s options (`--asin`, `--starts-with`, `--jobs`, `--ignore-errors`, `--format`, `--force`). |
+| `batch` | Downloads+converts a few titles at a time, deleting each `.aax` once it's converted, so a huge library never needs all its source files on disk at once. Resumable: tracks progress in `downloads/.sync_progress.json`, so stopping and re-running the same command continues where it left off. See [Large libraries / limited disk space](#large-libraries--limited-disk-space). | `--batch-size N` — titles per batch (default `5`); `--jobs N` — parallel downloads within a batch (default `3`); `--starts-with LETTER`; `--format {mp3,m4b}` (default `mp3`); `--keep-source` — don't delete the `.aax`/`.aaxc` after converting; `--min-free-gb N` — stop before a batch if free space drops below this (default `2.0`, `0` disables); `--ignore-errors`. |
 
 Run `python audible_mp3.py <command> --help` (or
 `docker compose run --rm audible-mp3 <command> --help`) for the same
@@ -174,6 +245,7 @@ bookshelf-decrypt/
 ├── Dockerfile             # python + ffmpeg + audible-cli, baked in
 ├── compose.yaml           # bind-mounts downloads/, mp3/, audible_config/
 ├── downloads/             # .aax/.aaxc files land here (gitignored)
+│   └── .sync_progress.json  # `batch`'s resume state (gitignored)
 ├── mp3/                   # converted .mp3 files land here (gitignored)
 ├── audible_config/        # audible-cli's login, Docker only (gitignored)
 └── .activation_bytes      # cached activation bytes (gitignored)
